@@ -1,4 +1,7 @@
+import asyncio
 import json
+import logging
+import random
 import shlex
 import uuid
 from collections.abc import AsyncIterator
@@ -46,6 +49,48 @@ from .._util.model import inspect_model
 from .._util.port import allocate_port
 from .._util.trace import trace
 from .agentbinary import claude_code_binary_source
+
+_logger = logging.getLogger(__name__)
+
+_BRIDGE_MAX_RETRIES = 7
+
+
+def _is_transient_bridge_error(e: Exception) -> bool:
+    """Check if an exception is a transient bridge/sandbox failure worth retrying.
+
+    Under concurrent execution, the sandbox bridge can fail transiently due to
+    K8s API overload, websocket drops, or sandbox-tools injection races.  These
+    errors are safe to retry with a fresh bridge and port.
+    """
+    error_msg = str(e)
+    type_name = type(e).__name__
+    # Walk the exception chain (__cause__) to catch wrapped errors
+    chain_types = set()
+    cur: BaseException | None = e
+    while cur is not None:
+        chain_types.add(type(cur).__name__)
+        cur = cur.__cause__
+    return (
+        # Bridge proxy failures
+        "Model proxy" in error_msg
+        or "address already in use" in error_msg
+        or ("Session ID" in error_msg and "already in use" in error_msg)
+        or "proxy process stream ended" in error_msg
+        or "exec_remote_start" in error_msg
+        # K8s transient failures (websocket drops, API server overload)
+        or "socket is already closed" in error_msg
+        or "No such file or directory" in error_msg
+        or "Permission denied" in error_msg
+        or "K8sError" in chain_types
+        or "PermissionError" in chain_types
+        or "WebSocketException" in chain_types
+        or "ApiException" in chain_types
+        # Sandbox tools injection failures
+        or "SandboxInjectionError" in chain_types
+        or "Injection failed" in error_msg
+        # Tenacity retry exhaustion (wraps transient failures)
+        or "RetryError" in type_name
+    )
 
 
 @agent
@@ -142,213 +187,260 @@ def claude_code(
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
 
     async def execute(state: AgentState) -> AgentState:
-        # determine port (use new port for each execution of agent on sample)
-        port = allocate_port()
-
-        async with sandbox_agent_bridge(
-            state,
-            model=model,
-            model_aliases=model_aliases,
-            filter=filter,
-            sandbox=sandbox,
-            retry_refusals=retry_refusals,
-            port=port,
-            bridged_tools=bridged_tools,
-        ) as bridge:
-            # ensure claude is installed and get binary location
-            claude_binary = await ensure_agent_binary_installed(
-                claude_code_binary_source(), version, user, sandbox_env(sandbox)
-            )
-
-            # allocate session_id
-            session_id = str(uuid.uuid4())
-
-            # base options
-            cmd = [
-                "--dangerously-skip-permissions",
-                "--model",
-                model,
-            ]
-
-            # add interactive options if not running as centaur
-            if centaur is False:
-                cmd.extend(["--print", "--output-format", "stream-json", "--verbose"])
-                if debug:
-                    cmd.append("--debug")
-
-            # system prompt
-            system_messages = [
-                m.text for m in state.messages if isinstance(m, ChatMessageSystem)
-            ]
-            if system_prompt is not None:
-                system_messages.append(system_prompt)
-            if system_messages:
-                cmd.extend(["--append-system-prompt", "\n\n".join(system_messages)])
-
-            # mcp servers (combine static configs with bridged tools)
-            cmd_allowed_tools: list[str] = []
-            all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
-            if all_mcp_servers:
-                mcp_server_args, mcp_allowed_tools = resolve_mcp_servers(
-                    all_mcp_servers
-                )
-                cmd.extend(mcp_server_args)
-                cmd_allowed_tools.extend(mcp_allowed_tools)
-
-            # add allowed and disallowed tools
-            if len(cmd_allowed_tools) > 0:
-                cmd.append("--allowed-tools")
-                cmd.append(",".join(cmd_allowed_tools))
-            if disallowed_tools is not None and len(disallowed_tools) > 0:
-                cmd.append("--disallowed-tools")
-                cmd.append(",".join(disallowed_tools))
-
-            prompt, has_assistant_response = build_user_prompt(state.messages)
-
-            # resolve sandbox
-            sbox = sandbox_env(sandbox)
-
-            # install skills
-            if resolved_skills is not None:
-                CLAUDE_SKILLS = ".claude/skills"
-                skills_dir = (
-                    join_path(cwd, CLAUDE_SKILLS) if cwd is not None else CLAUDE_SKILLS
-                )
-                await install_skills(resolved_skills, sbox, user, skills_dir)
-
-            # define agent env
-            agent_env = {
-                "ANTHROPIC_BASE_URL": f"http://localhost:{bridge.port}",
-                "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
-                "ANTHROPIC_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model or model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model or model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model or model,
-                "CLAUDE_CODE_SUBAGENT_MODEL": subagent_model or model,
-                "ANTHROPIC_SMALL_FAST_MODEL": haiku_model or model,
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-                "IS_SANDBOX": "1",
-            } | (env or {})
-
-            # Claude Code 2.1.37 reports "has Authorization header: false"
-            # despite ANTHROPIC_AUTH_TOKEN being set in the environment,
-            # then enters an OAuth flow that silently fails (rc=0, no
-            # output).  Providing an apiKeyHelper in settings.json
-            # supplies a key through a path that does work.
-            api_key = agent_env.get("ANTHROPIC_AUTH_TOKEN", "dummy-key-for-bridge")
-            await _seed_claude_config(sbox, api_key, user, cwd)
-
-            # centaur mode uses human_cli with custom instructions and bash rc
-            if centaur:
-                await run_claude_code_centaur(
-                    options=centaur,
-                    claude_cmd=[claude_binary] + cmd,
-                    agent_env=agent_env,
-                    state=state,
-                )
-            else:
-                # execute the agent (track debug output)
-                debug_output: list[str] = []
-                agent_prompt = prompt
-                attempt_count = 0
-                uncaught_error_count = 0
-                while True:
-                    # resume previous conversation
-                    if (
-                        has_assistant_response
-                        or attempt_count > 0
-                        or uncaught_error_count > 0
-                    ):
-                        agent_cmd = (
-                            [claude_binary, "--continue"] + cmd + ["--", agent_prompt]
-                        )
-                    else:
-                        agent_cmd = (
-                            [claude_binary, "--session-id", session_id]
-                            + cmd
-                            + ["--", agent_prompt]
-                        )
-
-                    # run agent
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=cwd,
-                            env=agent_env,
-                            user=user,
-                            concurrency=False,
-                        ),
-                        stream=False,
+        last_bridge_error: Exception | None = None
+        for bridge_attempt in range(_BRIDGE_MAX_RETRIES):
+            port = allocate_port()
+            try:
+                async with sandbox_agent_bridge(
+                    state,
+                    model=model,
+                    model_aliases=model_aliases,
+                    filter=filter,
+                    sandbox=sandbox,
+                    retry_refusals=retry_refusals,
+                    port=port,
+                    bridged_tools=bridged_tools,
+                ) as bridge:
+                    # ensure claude is installed and get binary location
+                    claude_binary = await ensure_agent_binary_installed(
+                        claude_code_binary_source(),
+                        version,
+                        user,
+                        sandbox_env(sandbox),
                     )
-                    # track debug output
-                    debug_output.append(result.stderr)
 
-                    # if we are in debug mode then save the jsonl in the store
-                    if debug:
-                        cc_debug = store_as(ClaudeCodeDebug)
-                        if result.stderr:
-                            cc_debug.stderr.append(result.stderr)
-                        if result.stdout:
-                            cc_debug.stdout.append(result.stdout)
+                    # allocate session_id
+                    session_id = str(uuid.uuid4())
 
-                    # decorate bridge events with agent spans
-                    annotate_agent_spans(result.stdout)
+                    # base options
+                    cmd = [
+                        "--dangerously-skip-permissions",
+                        "--model",
+                        model,
+                    ]
 
-                    # raise for error
-                    if not result.success:
-                        # if claude code exits with code 1 and no stderr, this
-                        # means an uncaught exception reached the top of its
-                        # main loop -- we treat this as a scaffold bug and
-                        # retry/resume a configurable number of times
-                        if (
-                            result.returncode == 1
-                            and len(result.stderr.strip()) == 0
-                            and retry_uncaught_errors is not None
-                            and uncaught_error_count < retry_uncaught_errors
-                        ):
-                            uncaught_error_count += 1
-                            continue
+                    # add interactive options if not running as centaur
+                    if centaur is False:
+                        cmd.extend(
+                            ["--print", "--output-format", "stream-json", "--verbose"]
+                        )
+                        if debug:
+                            cmd.append("--debug")
 
-                        # otherwise this is a hard failure
-                        raise RuntimeError(
-                            f"Error executing claude code agent {result.returncode}: {result.stderr}"
+                    # system prompt
+                    system_messages = [
+                        m.text
+                        for m in state.messages
+                        if isinstance(m, ChatMessageSystem)
+                    ]
+                    if system_prompt is not None:
+                        system_messages.append(system_prompt)
+                    if system_messages:
+                        cmd.extend(
+                            ["--append-system-prompt", "\n\n".join(system_messages)]
                         )
 
-                    # reset uncaught error counter
-                    uncaught_error_count = 0
+                    # mcp servers (combine static configs with bridged tools)
+                    cmd_allowed_tools: list[str] = []
+                    all_mcp_servers = (
+                        list(mcp_servers or []) + bridge.mcp_server_configs
+                    )
+                    if all_mcp_servers:
+                        mcp_server_args, mcp_allowed_tools = resolve_mcp_servers(
+                            all_mcp_servers
+                        )
+                        cmd.extend(mcp_server_args)
+                        cmd_allowed_tools.extend(mcp_allowed_tools)
 
-                    # exit if we are at max_attempts
-                    attempt_count += 1
-                    if attempt_count >= attempts.attempts:
-                        break
+                    # add allowed and disallowed tools
+                    if len(cmd_allowed_tools) > 0:
+                        cmd.append("--allowed-tools")
+                        cmd.append(",".join(cmd_allowed_tools))
+                    if disallowed_tools is not None and len(disallowed_tools) > 0:
+                        cmd.append("--disallowed-tools")
+                        cmd.append(",".join(disallowed_tools))
 
-                    # score this attempt
-                    answer_scores = await score(state)
+                    prompt, has_assistant_response = build_user_prompt(state.messages)
 
-                    # break if we score 'correct'
-                    if attempts.score_value(answer_scores[0].value) == 1.0:
-                        break
+                    # resolve sandbox
+                    sbox = sandbox_env(sandbox)
 
-                    # otherwise update prompt with incorrect message and continue
+                    # install skills
+                    if resolved_skills is not None:
+                        CLAUDE_SKILLS = ".claude/skills"
+                        skills_dir = (
+                            join_path(cwd, CLAUDE_SKILLS)
+                            if cwd is not None
+                            else CLAUDE_SKILLS
+                        )
+                        await install_skills(resolved_skills, sbox, user, skills_dir)
+
+                    # define agent env
+                    agent_env = {
+                        "ANTHROPIC_BASE_URL": f"http://localhost:{bridge.port}",
+                        "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
+                        "ANTHROPIC_MODEL": model,
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model or model,
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model or model,
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model or model,
+                        "CLAUDE_CODE_SUBAGENT_MODEL": subagent_model or model,
+                        "ANTHROPIC_SMALL_FAST_MODEL": haiku_model or model,
+                        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                        "IS_SANDBOX": "1",
+                    } | (env or {})
+
+                    # Claude Code 2.1.37 reports "has Authorization header: false"
+                    # despite ANTHROPIC_AUTH_TOKEN being set in the environment,
+                    # then enters an OAuth flow that silently fails (rc=0, no
+                    # output).  Providing an apiKeyHelper in settings.json
+                    # supplies a key through a path that does work.
+                    api_key = agent_env.get(
+                        "ANTHROPIC_AUTH_TOKEN", "dummy-key-for-bridge"
+                    )
+                    await _seed_claude_config(sbox, api_key, user, cwd)
+
+                    # centaur mode uses human_cli with custom instructions and bash rc
+                    if centaur:
+                        await run_claude_code_centaur(
+                            options=centaur,
+                            claude_cmd=[claude_binary] + cmd,
+                            agent_env=agent_env,
+                            state=state,
+                        )
                     else:
-                        if callable(attempts.incorrect_message):
-                            if not is_callable_coroutine(attempts.incorrect_message):
-                                raise ValueError(
-                                    "The incorrect_message function must be async."
+                        # execute the agent (track debug output)
+                        debug_output: list[str] = []
+                        agent_prompt = prompt
+                        attempt_count = 0
+                        uncaught_error_count = 0
+                        while True:
+                            # resume previous conversation
+                            if (
+                                has_assistant_response
+                                or attempt_count > 0
+                                or uncaught_error_count > 0
+                            ):
+                                agent_cmd = (
+                                    [claude_binary, "--continue"]
+                                    + cmd
+                                    + ["--", agent_prompt]
                                 )
-                            agent_prompt = await attempts.incorrect_message(
-                                state, answer_scores
+                            else:
+                                agent_cmd = (
+                                    [claude_binary, "--session-id", session_id]
+                                    + cmd
+                                    + ["--", agent_prompt]
+                                )
+
+                            # run agent
+                            result = await sbox.exec_remote(
+                                cmd=[
+                                    "bash",
+                                    "-c",
+                                    'exec 0</dev/null; "$@"',
+                                    "bash",
+                                ]
+                                + agent_cmd,
+                                options=ExecRemoteAwaitableOptions(
+                                    cwd=cwd,
+                                    env=agent_env,
+                                    user=user,
+                                    concurrency=False,
+                                ),
+                                stream=False,
                             )
-                        else:
-                            agent_prompt = attempts.incorrect_message
+                            # track debug output
+                            debug_output.append(result.stderr)
 
-                # trace debug info
-                debug_output.insert(0, "Claude Code Debug Output:")
-                trace("\n".join(debug_output))
+                            # if we are in debug mode then save the jsonl in the store
+                            if debug:
+                                cc_debug = store_as(ClaudeCodeDebug)
+                                if result.stderr:
+                                    cc_debug.stderr.append(result.stderr)
+                                if result.stdout:
+                                    cc_debug.stdout.append(result.stdout)
 
-        return bridge.state
+                            # decorate bridge events with agent spans
+                            annotate_agent_spans(result.stdout)
+
+                            # raise for error
+                            if not result.success:
+                                # if claude code exits with code 1 and no stderr,
+                                # this means an uncaught exception reached the top
+                                # of its main loop -- we treat this as a scaffold
+                                # bug and retry/resume a configurable number of
+                                # times
+                                if (
+                                    result.returncode == 1
+                                    and len(result.stderr.strip()) == 0
+                                    and retry_uncaught_errors is not None
+                                    and uncaught_error_count < retry_uncaught_errors
+                                ):
+                                    uncaught_error_count += 1
+                                    continue
+
+                                # otherwise this is a hard failure
+                                raise RuntimeError(
+                                    f"Error executing claude code agent {result.returncode}: {result.stderr}"
+                                )
+
+                            # reset uncaught error counter
+                            uncaught_error_count = 0
+
+                            # exit if we are at max_attempts
+                            attempt_count += 1
+                            if attempt_count >= attempts.attempts:
+                                break
+
+                            # score this attempt
+                            answer_scores = await score(state)
+
+                            # break if we score 'correct'
+                            if attempts.score_value(answer_scores[0].value) == 1.0:
+                                break
+
+                            # otherwise update prompt with incorrect message
+                            # and continue
+                            else:
+                                if callable(attempts.incorrect_message):
+                                    if not is_callable_coroutine(
+                                        attempts.incorrect_message
+                                    ):
+                                        raise ValueError(
+                                            "The incorrect_message function must be async."
+                                        )
+                                    agent_prompt = await attempts.incorrect_message(
+                                        state, answer_scores
+                                    )
+                                else:
+                                    agent_prompt = attempts.incorrect_message
+
+                        # trace debug info
+                        debug_output.insert(0, "Claude Code Debug Output:")
+                        trace("\n".join(debug_output))
+
+                return bridge.state
+            except Exception as e:
+                if (
+                    _is_transient_bridge_error(e)
+                    and bridge_attempt < _BRIDGE_MAX_RETRIES - 1
+                ):
+                    _logger.warning(
+                        "Bridge proxy failed (attempt %d/%d), retrying: %s",
+                        bridge_attempt + 1,
+                        _BRIDGE_MAX_RETRIES,
+                        e,
+                    )
+                    last_bridge_error = e
+                    # Exponential backoff with jitter to reduce K8s API pressure
+                    delay = min(2**bridge_attempt + random.uniform(0, 1), 30)
+                    _logger.info("Waiting %.1fs before bridge retry...", delay)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+        assert last_bridge_error is not None
+        raise last_bridge_error
 
     # return agent with specified name and descritpion
     return agent_with(execute, name=name, description=description)

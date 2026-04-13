@@ -2,8 +2,10 @@ from inspect_ai.model import ChatMessage, ChatMessageAssistant, ChatMessageUser
 
 
 def build_user_prompt(messages: list[ChatMessage]) -> tuple[str, bool]:
-    if messages and isinstance(messages[-1], ChatMessageAssistant):
-        raise ValueError("Messages input ends with an assistant messages.")
+    # Strip trailing assistant messages — they don't contribute to the prompt
+    # and would incorrectly trigger --continue mode on the first invocation.
+    while messages and isinstance(messages[-1], ChatMessageAssistant):
+        messages = messages[:-1]
 
     last_assistant_idx = next(
         (
