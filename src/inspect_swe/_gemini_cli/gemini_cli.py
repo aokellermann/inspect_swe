@@ -18,13 +18,13 @@ from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import sandbox as sandbox_env
-from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
+from inspect_swe._util.port import allocate_port
 from inspect_swe._util.trace import trace
 
 from .agentbinary import ensure_gemini_cli_setup
@@ -105,9 +105,7 @@ def gemini_cli(
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
-        MODEL_PORT = "gemini_cli_model_port"
-        port = store().get(MODEL_PORT, 3000) + 1
-        store().set(MODEL_PORT, port)
+        port = allocate_port()
 
         async with sandbox_agent_bridge(
             state,

@@ -9,12 +9,13 @@ from typing import Literal
 from inspect_ai.agent import AgentState, SandboxAgentBridge, agent, sandbox_agent_bridge
 from inspect_ai.model import Model, get_model
 from inspect_ai.tool import Skill, install_skills, read_skills
-from inspect_ai.util import ExecRemoteProcess, ExecRemoteStreamingOptions, store
+from inspect_ai.util import ExecRemoteProcess, ExecRemoteStreamingOptions
 from inspect_ai.util import sandbox as sandbox_env
 from typing_extensions import Unpack
 
 from inspect_swe._gemini_cli.agentbinary import ensure_gemini_cli_setup
 from inspect_swe._util.path import join_path
+from inspect_swe._util.port import allocate_port
 from inspect_swe.acp import ACPAgent
 from inspect_swe.acp.agent import ACPAgentParams
 
@@ -55,9 +56,7 @@ class GeminiCli(ACPAgent):
         model = get_model(self.model)
 
         # Use a unique port per sample (mirrors non-ACP gemini_cli approach).
-        MODEL_PORT = "gemini_acp_model_port"
-        port = store().get(MODEL_PORT, 3000) + 1
-        store().set(MODEL_PORT, port)
+        port = allocate_port()
 
         async with sandbox_agent_bridge(
             state,

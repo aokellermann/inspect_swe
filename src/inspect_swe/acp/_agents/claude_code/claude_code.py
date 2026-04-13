@@ -13,6 +13,7 @@ from inspect_ai.util import sandbox as sandbox_env
 from typing_extensions import Unpack
 
 from inspect_swe._util.path import join_path
+from inspect_swe._util.port import allocate_port
 from inspect_swe.acp import ACPAgent
 from inspect_swe.acp.agent import ACPAgentParams
 
@@ -68,6 +69,8 @@ class ClaudeCode(ACPAgent):
         sbox = sandbox_env(self.sandbox)
         default_model = get_model(self.model).canonical_name()
 
+        port = allocate_port()
+
         async with sandbox_agent_bridge(
             state,
             model=None,
@@ -75,6 +78,7 @@ class ClaudeCode(ACPAgent):
             filter=self.filter,
             retry_refusals=self.retry_refusals,
             bridged_tools=self.bridged_tools or None,
+            port=port,
         ) as bridge:
             # Install node and claude-agent-acp in the sandbox.
             acp_binary, node_binary = await ensure_claude_code_acp_setup(

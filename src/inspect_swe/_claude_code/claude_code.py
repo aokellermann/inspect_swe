@@ -24,7 +24,6 @@ from inspect_ai.util import (
     ExecStderr,
     ExecStdout,
     StoreModel,
-    store,
     store_as,
 )
 from inspect_ai.util import (
@@ -44,6 +43,7 @@ from .._util._async import is_callable_coroutine
 from .._util.agentbinary import ensure_agent_binary_installed
 from .._util.messages import build_user_prompt
 from .._util.model import inspect_model
+from .._util.port import allocate_port
 from .._util.trace import trace
 from .agentbinary import claude_code_binary_source
 
@@ -143,9 +143,7 @@ def claude_code(
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
-        MODEL_PORT = "claude_code_model_port"
-        port = store().get(MODEL_PORT, 3000) + 1
-        store().set(MODEL_PORT, port)
+        port = allocate_port()
 
         async with sandbox_agent_bridge(
             state,

@@ -21,13 +21,13 @@ from inspect_ai.model import (
 )
 from inspect_ai.scorer import score
 from inspect_ai.util import sandbox as sandbox_env
-from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from .._util._async import is_callable_coroutine
 from .._util.agentwheel import AgentWheelSource, ensure_agent_wheel_installed
 from .._util.centaur import CentaurOptions, run_centaur
 from .._util.messages import build_user_prompt
+from .._util.port import allocate_port
 from .._util.trace import trace
 from .setup import (
     RESUMABLE_AGENT_PATH,
@@ -120,9 +120,7 @@ def mini_swe_agent(
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
-        MODEL_PORT = "mini_swe_agent_model_port"
-        port = store().get(MODEL_PORT, 4000) + 1
-        store().set(MODEL_PORT, port)
+        port = allocate_port()
 
         # ensure that openai doesn't use repsonses_api
         bridge_model = _model_without_responses_api(model)
