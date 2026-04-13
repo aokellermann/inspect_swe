@@ -13,12 +13,12 @@ from inspect_ai.util import (
     ExecRemoteProcess,
     ExecRemoteStreamingOptions,
     SandboxEnvironment,
-    store,
 )
 from inspect_ai.util import sandbox as sandbox_env
 from typing_extensions import Unpack
 
 from inspect_swe._util.path import join_path
+from inspect_swe._util.port import allocate_port
 from inspect_swe._util.sandbox import sandbox_exec
 from inspect_swe._util.toml import to_toml
 from inspect_swe.acp import ACPAgent
@@ -60,9 +60,7 @@ class CodexCli(ACPAgent):
 
         # Use a unique port per sample to avoid conflicts with codex-core's
         # internal services (mirrors the non-ACP codex_cli approach).
-        MODEL_PORT = "codex_acp_model_port"
-        port = store().get(MODEL_PORT, 3000) + 1
-        store().set(MODEL_PORT, port)
+        port = allocate_port()
 
         async with sandbox_agent_bridge(
             state,
