@@ -142,7 +142,6 @@ def claude_code(
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
 
     async def execute(state: AgentState) -> AgentState:
-        # determine port (use new port for each execution of agent on sample)
         port = allocate_port()
 
         async with sandbox_agent_bridge(
@@ -159,9 +158,6 @@ def claude_code(
             claude_binary = await ensure_agent_binary_installed(
                 claude_code_binary_source(), version, user, sandbox_env(sandbox)
             )
-
-            # allocate session_id
-            session_id = str(uuid.uuid4())
 
             # base options
             cmd = [
@@ -265,7 +261,7 @@ def claude_code(
                         )
                     else:
                         agent_cmd = (
-                            [claude_binary, "--session-id", session_id]
+                            [claude_binary]
                             + cmd
                             + ["--", agent_prompt]
                         )
